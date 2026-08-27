@@ -2,16 +2,20 @@ package com.meridian.policy.service;
 
 import com.meridian.policy.domain.*;
 import com.meridian.policy.dto.*;
+import com.meridian.policy.events.EventPublisher;
 import com.meridian.policy.repo.*;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
+import java.time.format.DateTimeParseException;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.Map;
 
 @Service
 public class PolicyAdminService {
@@ -23,8 +27,11 @@ public class PolicyAdminService {
     private final PremiumExposureRatingBasisRepository exposureRepo;
     private final PolicyholderPartyProfileRepository partyRepo;
     private final ProducerAgencyContractRepository producerRepo;
+    private final NamedParameterJdbcTemplate jdbc;
+    private final EventPublisher eventPublisher;
 
-    private final AtomicInteger seq = new AtomicInteger(1);
+    @Value("${meridian.pii.key:change-me-in-prod}")
+    private String piiKey;
 
     public PolicyAdminService(CommercialPolicyMasterRepository policyRepo,
                               PolicyCoverageLineDetailRepository coverageRepo,
@@ -32,7 +39,9 @@ public class PolicyAdminService {
                               PolicyEndorsementTransactionRepository endorsementRepo,
                               PremiumExposureRatingBasisRepository exposureRepo,
                               PolicyholderPartyProfileRepository partyRepo,
-                              ProducerAgencyContractRepository producerRepo) {
+                              ProducerAgencyContractRepository producerRepo,
+                              NamedParameterJdbcTemplate jdbc,
+                              EventPublisher eventPublisher) {
         this.policyRepo = policyRepo;
         this.coverageRepo = coverageRepo;
         this.locationRepo = locationRepo;
@@ -40,6 +49,8 @@ public class PolicyAdminService {
         this.exposureRepo = exposureRepo;
         this.partyRepo = partyRepo;
         this.producerRepo = producerRepo;
+        this.jdbc = jdbc;
+        this.eventPublisher = eventPublisher;
     }
 
     @Transactional
@@ -121,6 +132,13 @@ public class PolicyAdminService {
                 locationRepo.save(loc);
             }
         }
+        eventPublisher.publish("pas.policy.events", "PolicyBoundEvent",
+                Map.of("policy_number", p.getPolicyNumber(),
+                        "policyholder_id", String.valueOf(p.getPolicyholderId()),
+                        "producer_id", String.valueOf(p.getProducerId()),
+                        "written_premium", p.getWrittenPremiumAmount().toString(),
+                        "term_effective", p.getPolicyTermEffectiveDate().toString(),
+                        "term_expiration", p.getPolicyTermExpirationDate().toString()));
         return toResponse(p);
     }
 
@@ -149,19 +167,35 @@ public class PolicyAdminService {
         p.setWrittenPremiumAmount(p.getWrittenPremiumAmount().add(req.premiumDeltaAmount()));
         if (!"CANCELLED".equals(p.getPolicyStatusCode())) p.setPolicyStatusCode("ENDORSED");
         policyRepo.save(p);
+        eventPublisher.publish("pas.policy.events", "EndorsementIssuedEvent",
+                Map.of("policy_number", p.getPolicyNumber(),
+                        "endorsement_seq", String.valueOf(e.getEndorsementSequenceNumber()),
+                        "premium_delta", e.getPremiumDeltaAmount().toString()));
         return e;
     }
 
     @Transactional
-    public PolicyResponse cancelPolicy(String policyNumber, LocalDate cancellationDate, String reasonCode) {
+    public PolicyResponse cancelPolicy(String policyNumber, String cancellationDateStr, String reasonCode) {
         CommercialPolicyMaster p = policyRepo.findByPolicyNumber(policyNumber)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "policy not found"));
         if ("CANCELLED".equals(p.getPolicyStatusCode()))
             throw new ResponseStatusException(HttpStatus.CONFLICT, "already cancelled");
+        LocalDate cancellationDate = null;
+        if (cancellationDateStr != null && !cancellationDateStr.isBlank()) {
+            try {
+                cancellationDate = LocalDate.parse(cancellationDateStr);
+            } catch (DateTimeParseException ex) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "invalid cancellationDate: " + cancellationDateStr);
+            }
+        }
         p.setPolicyStatusCode("CANCELLED");
         p.setCancellationDate(cancellationDate != null ? cancellationDate : LocalDate.now());
         p.setCancellationReasonCode(reasonCode);
         p = policyRepo.save(p);
+        eventPublisher.publish("pas.policy.events", "PolicyCancelledEvent",
+                Map.of("policy_number", p.getPolicyNumber(),
+                        "cancellation_date", p.getCancellationDate().toString(),
+                        "reason_code", reasonCode != null ? reasonCode : ""));
         return toResponse(p);
     }
 
@@ -187,11 +221,45 @@ public class PolicyAdminService {
         );
     }
 
-    private String nextPolicyNumber(String productCode) {
-        int n = seq.getAndIncrement();
+    private synchronized String nextPolicyNumber(String productCode) {
         String lob = switch (productCode) {
             case "CGL" -> "GL"; case "CPROP" -> "PROP"; case "WC" -> "WC"; case "CAUTO" -> "CAUTO"; default -> productCode;
         };
-        return "MMG-%s-%d-%06d".formatted(lob, LocalDate.now().getYear(), n);
+        int year = LocalDate.now().getYear();
+        String prefix = "MMG-%s-%d-".formatted(lob, year);
+        String likePattern = prefix + "%";
+        List<Map<String, Object>> rows = jdbc.queryForList(
+                """
+                SELECT policy_number FROM pas.commercial_policy_master
+                WHERE policy_number LIKE :pattern
+                ORDER BY policy_number DESC LIMIT 1
+                """,
+                Map.of("pattern", likePattern));
+        int nextSeq = 1;
+        if (!rows.isEmpty()) {
+            String maxNum = (String) rows.get(0).get("policy_number");
+            String seqStr = maxNum.substring(prefix.length());
+            try { nextSeq = Integer.parseInt(seqStr) + 1; } catch (NumberFormatException ignored) {}
+        }
+        String candidate = "MMG-%s-%d-%06d".formatted(lob, year, nextSeq);
+        // retry-on-conflict loop for concurrent inserts
+        for (int attempt = 0; attempt < 3; attempt++) {
+            if (!policyRepo.existsByPolicyNumber(candidate)) return candidate;
+            nextSeq++;
+            candidate = "MMG-%s-%d-%06d".formatted(lob, year, nextSeq);
+        }
+        return candidate;
+    }
+
+    /** Encrypt FEIN at write time via pgcrypto; call after saving party with placeholder. */
+    public void encryptFein(Long policyholderId, String plainFein) {
+        if (plainFein == null || plainFein.isBlank()) return;
+        jdbc.update(
+                """
+                UPDATE pas.policyholder_party_profile
+                SET fein_encrypted = pgp_sym_encrypt(:plain, :key)
+                WHERE policyholder_id = :id
+                """,
+                Map.of("plain", plainFein, "key", piiKey, "id", policyholderId));
     }
 }

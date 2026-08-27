@@ -9,3 +9,8 @@ spring:
     enabled: true
     locations: classpath:db/migration
     schemas: pas
+meridian:
+  pii:
+    key: test-key-1234567890
+  events:
+    enabled: false

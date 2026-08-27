@@ -43,7 +43,7 @@ public class PolicyAdminController {
                                  @RequestBody(required = false) Map<String, String> body) {
         String reason = body != null ? body.get("reasonCode") : null;
         String date = body != null ? body.get("cancellationDate") : null;
-        return service.cancelPolicy(policyNumber, date != null ? LocalDate.parse(date) : null, reason);
+        return service.cancelPolicy(policyNumber, date, reason);
     }
 
     @GetMapping("/health")

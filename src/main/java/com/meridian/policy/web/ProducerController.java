@@ -21,5 +21,5 @@ public class ProducerController {
     }
 
     @GetMapping public List<ProducerAgencyContract> list() { return repo.findAll(); }
-    @GetMapping("/{id}") public ProducerAgencyContract get(@PathVariable Long id) { return repo.findById(id).orElseThrow(); }
+    @GetMapping("/{id}") public ProducerAgencyContract get(@PathVariable Long id) { return repo.findById(id).orElseThrow(() -> new org.springframework.web.server.ResponseStatusException(org.springframework.http.HttpStatus.NOT_FOUND, "producer not found")); }
 }

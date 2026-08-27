@@ -3,9 +3,6 @@ server:
 
 spring:
   datasource:
-    # Local stack per .commandcode/skills/meridian-local-stack/SKILL.md
-    # Host PG 5432 (postgres/postgres) is live on this machine. Compose PG is 5433.
-    # Override with SPRING_DATASOURCE_URL when running against compose.
     url: jdbc:postgresql://127.0.0.1:5432/postgres
     username: postgres
     password: postgres
@@ -25,3 +22,13 @@ spring:
     schemas: pas
     default-schema: pas
     baseline-on-migrate: true
+  kafka:
+    bootstrap-servers: localhost:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+meridian:
+  pii:
+    key: change-me-in-prod
+  events:
+    enabled: false
